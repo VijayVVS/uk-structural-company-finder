@@ -2,20 +2,23 @@ import os
 import re
 import time
 import math
+import json
 import requests
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
-# ---------- Config (from GitHub Secrets/Vars) ----------
+# ---------- Config ----------
 API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-HOME_POSTCODE = os.getenv("HOME_POSTCODE", "M1 1AE")  # default: Manchester (change!)
-RADIUS_M = int(os.getenv("SEARCH_RADIUS_M", "25000"))
-QUERY = os.getenv("SEARCH_QUERY", "structural engineering consultants")
+HOME_POSTCODE = os.getenv("HOME_POSTCODE", "SK3 9AR")
+RADIUS_M = int(os.getenv("SEARCH_RADIUS_M", "30000"))
+QUERY = os.getenv("SEARCH_QUERY", "civil and structural engineers")
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "25"))
 
 if not API_KEY:
     raise SystemExit("Missing GOOGLE_MAPS_API_KEY (add it as a GitHub repo secret).")
 
-UA = {"User-Agent": "FBC-CompanyFinder/1.0 (respect robots and rate limits)"}
+UA = {"User-Agent": "FBC-CompanyFinder/1.0"}
 TIMEOUT = 25
 
 # Only accept role-based emails (avoid personal email harvesting)
@@ -25,11 +28,15 @@ GENERIC_EMAIL = re.compile(
     re.IGNORECASE
 )
 
-# Candidate pages to check ON THE COMPANY WEBSITE ONLY
 CANDIDATE_PATHS = [
     "/", "/careers", "/careers/", "/jobs", "/jobs/", "/join-us", "/join-us/",
-    "/work-with-us", "/work-with-us/", "/contact", "/contact/", "/about", "/about/"
+    "/work-with-us", "/work-with-us/", "/contact", "/contact/", "/contact-us", "/contact-us/",
+    "/vacancies", "/vacancies/", "/join", "/join/"
 ]
+
+SEEN_PATH = "data/seen_companies.json"
+MASTER_PATH = "data/master_companies.xlsx"   # optional running master
+OUT_DAILY_DIR = "out"
 
 def http_get(url: str, params=None):
     r = requests.get(url, params=params, headers=UA, timeout=TIMEOUT)
@@ -41,26 +48,17 @@ def geocode_postcode(postcode: str):
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     data = http_get(url, params={"address": postcode, "key": API_KEY}).json()
     if data.get("status") != "OK" or not data.get("results"):
-        raise SystemExit(f"Geocode failed for postcode '{postcode}': {data.get('status')}")
+        raise SystemExit(f"Geocode failed for '{postcode}': {data.get('status')} {data.get('error_message')}")
     loc = data["results"][0]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
 
 def places_text_search(query: str, lat: float, lng: float, radius_m: int, pagelimit=3):
-    """
-    Uses Places Text Search, location biased by radius.
-    Returns list of place results (name, place_id, formatted_address, etc.)
-    """
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     results = []
     page_token = None
 
     for _ in range(pagelimit):
-        params = {
-            "query": query,
-            "location": f"{lat},{lng}",
-            "radius": radius_m,
-            "key": API_KEY
-        }
+        params = {"query": query, "location": f"{lat},{lng}", "radius": radius_m, "key": API_KEY}
         if page_token:
             params["pagetoken"] = page_token
 
@@ -68,16 +66,13 @@ def places_text_search(query: str, lat: float, lng: float, radius_m: int, pageli
         status = data.get("status")
 
         if status not in ("OK", "ZERO_RESULTS"):
-            # OVER_QUERY_LIMIT, REQUEST_DENIED, INVALID_REQUEST etc.
             raise SystemExit(f"Places search error: {status} - {data.get('error_message')}")
 
         results.extend(data.get("results", []))
         page_token = data.get("next_page_token")
         if not page_token:
             break
-
-        # Google requires a short wait before next_page_token becomes valid
-        time.sleep(2.2)
+        time.sleep(2.2)  # token warm-up
 
     return results
 
@@ -89,7 +84,7 @@ def place_details(place_id: str):
         return None
     return data.get("result", {})
 
-# ---------- Website email extraction (company site only) ----------
+# ---------- Website email extraction ----------
 def normalize_base(website: str):
     if not website:
         return ""
@@ -98,9 +93,6 @@ def normalize_base(website: str):
         website = "https://" + website
         p = urlparse(website)
     return f"{p.scheme}://{p.netloc}"
-
-def same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc.lower() == urlparse(base).netloc.lower()
 
 def extract_generic_emails_from_site(base: str):
     found = set()
@@ -117,11 +109,11 @@ def extract_generic_emails_from_site(base: str):
         for m in GENERIC_EMAIL.finditer(html):
             found.add(m.group(0))
 
-        time.sleep(0.5)
+        time.sleep(0.4)
 
     return sorted(found), checked
 
-# ---------- Distance (rough) ----------
+# ---------- Distance ----------
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
     p1 = math.radians(lat1); p2 = math.radians(lat2)
@@ -130,80 +122,158 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlon/2)**2
     return 2 * R * math.asin(math.sqrt(a))
 
-def main():
-    lat, lng = geocode_postcode(HOME_POSTCODE)
+# ---------- Seen state ----------
+def load_seen():
+    os.makedirs(os.path.dirname(SEEN_PATH), exist_ok=True)
+    if not os.path.exists(SEEN_PATH):
+        return {"seen_place_ids": [], "seen_domains": []}
+    with open(SEEN_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    # Search
+def save_seen(seen):
+    with open(SEEN_PATH, "w", encoding="utf-8") as f:
+        json.dump(seen, f, indent=2)
+
+# ---------- Excel helpers ----------
+def write_daily_excel(rows, out_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Daily 25"
+    headers = [
+        "run_date_utc",
+        "company_name",
+        "distance_km",
+        "address",
+        "phone",
+        "website",
+        "generic_recruitment_emails_on_website",
+        "pages_checked",
+        "google_maps_place_url",
+        "place_id",
+        "company_domain"
+    ]
+    ws.append(headers)
+    for r in rows:
+        ws.append([r.get(h, "") for h in headers])
+    wb.save(out_path)
+
+def append_to_master(rows):
+    # keep a running master workbook (optional)
+    os.makedirs(os.path.dirname(MASTER_PATH), exist_ok=True)
+    headers = [
+        "run_date_utc",
+        "company_name",
+        "distance_km",
+        "address",
+        "phone",
+        "website",
+        "generic_recruitment_emails_on_website",
+        "pages_checked",
+        "google_maps_place_url",
+        "place_id",
+        "company_domain"
+    ]
+
+    if not os.path.exists(MASTER_PATH):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Master"
+        ws.append(headers)
+        wb.save(MASTER_PATH)
+
+    wb = load_workbook(MASTER_PATH)
+    ws = wb["Master"]
+    for r in rows:
+        ws.append([r.get(h, "") for h in headers])
+    wb.save(MASTER_PATH)
+
+def main():
+    seen = load_seen()
+    seen_place_ids = set(seen.get("seen_place_ids", []))
+    seen_domains = set(seen.get("seen_domains", []))
+
+    lat, lng = geocode_postcode(HOME_POSTCODE)
     places = places_text_search(QUERY, lat, lng, RADIUS_M, pagelimit=3)
 
-    # De-dup by place_id
-    seen = set()
-    rows = []
-
+    # Sort by distance (closest first)
+    enriched = []
     for p in places:
+        try:
+            gloc = p["geometry"]["location"]
+            dist = haversine_km(lat, lng, gloc["lat"], gloc["lng"])
+        except Exception:
+            dist = 9999.0
+        enriched.append((dist, p))
+    enriched.sort(key=lambda x: x[0])
+
+    selected_rows = []
+    for dist, p in enriched:
+        if len(selected_rows) >= DAILY_LIMIT:
+            break
+
         pid = p.get("place_id")
-        if not pid or pid in seen:
+        if not pid or pid in seen_place_ids:
             continue
-        seen.add(pid)
 
         det = place_details(pid)
         if not det:
             continue
 
-        name = det.get("name", "")
-        website = det.get("website", "")
-        address = det.get("formatted_address", "")
-        phone = det.get("international_phone_number", "")
-        maps_url = det.get("url", "")
-
+        website = det.get("website", "") or ""
         base = normalize_base(website)
-        emails = []
-        checked = []
+        domain = urlparse(base).netloc.lower() if base else ""
 
+        # Dedupe by domain too (helps when Maps has multiple listings)
+        if domain and domain in seen_domains:
+            # mark the place ID as seen as well to avoid revisiting
+            seen_place_ids.add(pid)
+            continue
+
+        emails, checked = ([], [])
         if base:
             emails, checked = extract_generic_emails_from_site(base)
 
-        # add distance if geometry present in search results
-        dist_km = ""
-        try:
-            gloc = p["geometry"]["location"]
-            dist_km = round(haversine_km(lat, lng, gloc["lat"], gloc["lng"]), 1)
-        except Exception:
-            pass
-
-        rows.append({
-            "company_name": name,
-            "distance_km": dist_km,
-            "address": address,
-            "phone": phone,
+        row = {
+            "run_date_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "company_name": det.get("name", ""),
+            "distance_km": round(dist, 1) if dist < 9000 else "",
+            "address": det.get("formatted_address", ""),
+            "phone": det.get("international_phone_number", ""),
             "website": website,
             "generic_recruitment_emails_on_website": " | ".join(emails),
             "pages_checked": " | ".join(checked[:6]),
-            "google_maps_place_url": maps_url,
-        })
+            "google_maps_place_url": det.get("url", ""),
+            "place_id": pid,
+            "company_domain": domain
+        }
 
-    # Sort: closest first (blank distances last)
-    def sort_key(r):
-        return (9999 if r["distance_km"] == "" else r["distance_km"], r["company_name"].lower())
-    rows.sort(key=sort_key)
+        selected_rows.append(row)
 
-    # Write Excel
-    os.makedirs("out", exist_ok=True)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "UK Firms Near Me"
+        # Update seen as soon as we accept it
+        seen_place_ids.add(pid)
+        if domain:
+            seen_domains.add(domain)
 
-    headers = list(rows[0].keys()) if rows else [
-        "company_name","distance_km","address","phone","website",
-        "generic_recruitment_emails_on_website","pages_checked","google_maps_place_url"
-    ]
-    ws.append(headers)
-    for r in rows:
-        ws.append([r.get(h, "") for h in headers])
+        time.sleep(0.2)
 
-    out_path = "out/uk_structural_companies_near_me.xlsx"
-    wb.save(out_path)
-    print(f"Saved {len(rows)} rows -> {out_path}")
+    # Save seen state
+    seen["seen_place_ids"] = sorted(seen_place_ids)
+    seen["seen_domains"] = sorted(seen_domains)
+    save_seen(seen)
+
+    # Write outputs
+    os.makedirs(OUT_DAILY_DIR, exist_ok=True)
+    daily_name = f"uk_companies_{datetime.now(timezone.utc).strftime('%Y%m%d')}.xlsx"
+    daily_path = os.path.join(OUT_DAILY_DIR, daily_name)
+    write_daily_excel(selected_rows, daily_path)
+
+    # Optional: keep a master workbook in /data
+    append_to_master(selected_rows)
+
+    print(f"Selected {len(selected_rows)} new companies (limit={DAILY_LIMIT}).")
+    print(f"Daily Excel: {daily_path}")
+    print(f"Master Excel: {MASTER_PATH}")
+    print(f"Seen file updated: {SEEN_PATH}")
 
 if __name__ == "__main__":
     main()
