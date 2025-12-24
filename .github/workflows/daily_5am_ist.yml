@@ -1,0 +1,39 @@
+name: UK Structural Companies Near Me (Daily 5AM IST)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 05:00 IST = 23:30 UTC (previous day)
+    - cron: "30 23 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests openpyxl
+
+      - name: Run search + website email extraction
+        env:
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+          HOME_POSTCODE: ${{ secrets.HOME_POSTCODE }}
+          SEARCH_RADIUS_M: ${{ secrets.SEARCH_RADIUS_M }}
+          SEARCH_QUERY: ${{ secrets.SEARCH_QUERY }}
+        run: |
+          python scripts/find_structural_firms_uk.py
+
+      - name: Upload Excel
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk_structural_companies_near_me
+          path: out/uk_structural_companies_near_me.xlsx
